@@ -246,6 +246,115 @@ fn test_exp_operation() -> Result<()> {
     Ok(())
 }
 
+// "Reciprocal"
+#[test]
+fn test_reciprocal_operation() -> Result<()> {
+    let manual_graph = create_model_proto_with_graph(Some(GraphProto {
+        node: vec![NodeProto {
+            op_type: "Reciprocal".to_string(),
+            domain: "".to_string(),
+            attribute: vec![],
+            input: vec![INPUT_X.to_string()],
+            output: vec![OUTPUT_Z.to_string()],
+            name: "".to_string(),
+            doc_string: "".to_string(),
+        }],
+        name: "".to_string(),
+        initializer: vec![],
+        input: vec![],
+        output: vec![ValueInfoProto {
+            name: OUTPUT_Z.to_string(),
+            doc_string: "".to_string(),
+            r#type: None,
+        }],
+        value_info: vec![],
+        doc_string: "".to_string(),
+        sparse_initializer: vec![],
+        quantization_annotation: vec![],
+    }));
+
+    let x = Tensor::from_vec(vec![1.0f32, 2.0f32, 4.0f32, 0.5f32], &[2, 2], &Device::Cpu)?;
+
+    let mut inputs: HashMap<String, Tensor> = HashMap::new();
+    inputs.insert(INPUT_X.to_string(), x);
+
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
+    assert_eq!(eval.len(), 1);
+
+    let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
+
+    let results = z.to_vec2::<f32>()?;
+
+    assert_eq!(results, vec![vec![1.0f32, 0.5f32], vec![0.25f32, 2.0f32]]);
+
+    Ok(())
+}
+
+// "ReduceSum" with `axes` as an ATTRIBUTE (opset ≤12). Regression for a bug
+// where candle only read `axes` from input[1] (opset ≥13) and otherwise reduced
+// ALL axes — which silently broke opset-11 models (e.g. MediaPipe blendshapes).
+#[test]
+fn test_reduce_sum_attribute_axes() -> Result<()> {
+    let axes_attr = AttributeProto {
+        name: "axes".to_string(),
+        ref_attr_name: "".to_string(),
+        i: 0,
+        doc_string: "".to_string(),
+        r#type: 7, // INTS
+        f: 0.0,
+        s: vec![],
+        t: None,
+        g: None,
+        sparse_tensor: None,
+        tp: None,
+        floats: vec![],
+        ints: vec![2],
+        strings: vec![],
+        tensors: vec![],
+        graphs: vec![],
+        sparse_tensors: vec![],
+        type_protos: vec![],
+    };
+    let manual_graph = create_model_proto_with_graph(Some(GraphProto {
+        node: vec![NodeProto {
+            op_type: "ReduceSum".to_string(),
+            domain: "".to_string(),
+            attribute: vec![axes_attr],
+            input: vec![INPUT_X.to_string()],
+            output: vec![OUTPUT_Z.to_string()],
+            name: "".to_string(),
+            doc_string: "".to_string(),
+        }],
+        name: "".to_string(),
+        initializer: vec![],
+        input: vec![],
+        output: vec![ValueInfoProto {
+            name: OUTPUT_Z.to_string(),
+            doc_string: "".to_string(),
+            r#type: None,
+        }],
+        value_info: vec![],
+        doc_string: "".to_string(),
+        sparse_initializer: vec![],
+        quantization_annotation: vec![],
+    }));
+
+    // [1,2,3]; reduce only axis 2 (keepdims default = 1) → [1,2,1] row sums.
+    let x = Tensor::from_vec(
+        vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+        &[1, 2, 3],
+        &Device::Cpu,
+    )?;
+    let mut inputs: HashMap<String, Tensor> = HashMap::new();
+    inputs.insert(INPUT_X.to_string(), x);
+
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
+    let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
+    assert_eq!(z.dims(), &[1, 2, 1]);
+    assert_eq!(z.flatten_all()?.to_vec1::<f32>()?, vec![6.0, 15.0]);
+    Ok(())
+}
+
 // "Equal"
 #[test]
 fn test_equal_operation() -> Result<()> {

@@ -748,6 +748,12 @@ fn simple_eval_(
                 let output = xs.sqrt()?;
                 values.insert(node.output[0].clone(), output);
             }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Reciprocal
+            "Reciprocal" => {
+                let xs = get(&node.input[0])?;
+                let output = xs.recip()?;
+                values.insert(node.output[0].clone(), output);
+            }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Range
             "Range" => {
                 let start = get(&node.input[0])?;
@@ -1668,23 +1674,29 @@ fn simple_eval_(
             // Version 13 impl
             "ReduceSum" => {
                 let input = get(&node.input[0])?;
-                let axes = get_opt(1);
                 let keepdims = get_attr_opt::<i64>(node, "keepdims")?.copied().unwrap_or(1);
                 let noop_with_empty_axes = get_attr_opt::<i64>(node, "noop_with_empty_axes")?
                     .copied()
                     .unwrap_or(0);
+                let n_dims = input.rank();
 
-                let axes = match axes {
-                    Some(Ok(axes)) => axes
-                        .to_vec1::<i64>()?
+                // Opset ≥13 takes `axes` as an optional second input; opset ≤12
+                // takes it as an attribute. Support both, and resolve negatives.
+                let raw_axes: Option<Vec<i64>> = match get_opt(1) {
+                    Some(Ok(axes)) => Some(axes.to_vec1::<i64>()?),
+                    Some(Err(_)) | None => get_attr_opt::<[i64]>(node, "axes")?.map(|a| a.to_vec()),
+                };
+
+                let axes = match raw_axes {
+                    Some(axes) => axes
                         .into_iter()
-                        .map(|x| x as usize)
+                        .map(|x| (if x < 0 { n_dims as i64 + x } else { x }) as usize)
                         .collect::<Vec<_>>(),
-                    Some(Err(_)) | None => {
+                    None => {
                         if noop_with_empty_axes == 1 {
                             vec![]
                         } else {
-                            (0..input.rank()).collect()
+                            (0..n_dims).collect()
                         }
                     }
                 };
