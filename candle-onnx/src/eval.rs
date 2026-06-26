@@ -1174,12 +1174,10 @@ fn simple_eval_(
                 let mode = get_attr_opt(node, "mode")?.unwrap_or("constant");
                 let data = get(&node.input[0])?;
                 let pads = get(&node.input[1])?;
-                if node.input.len() > 2 {
-                    bail!(
-                        "unsupported number of inputs {} for Pad node {:?}, expected 2",
-                        node.input.len(),
-                        node.name
-                    );
+                // Optional inputs: [2] constant_value, [3] axes. `axes` (per-axis
+                // padding subset) is not supported yet.
+                if node.input.len() > 3 && !node.input[3].is_empty() {
+                    bail!("unsupported 'axes' input for Pad node {:?}", node.name);
                 }
                 if pads.rank() != 1 {
                     bail!("Pad expects 'pads' input to be 1D vector: {pads:?}");
@@ -1192,6 +1190,52 @@ fn simple_eval_(
                 let (pads_pre, pads_post) = pads.split_at(pads.len() / 2);
 
                 match mode {
+                    // https://github.com/onnx/onnx/blob/main/docs/Operators.md#pad
+                    "constant" => {
+                        // Optional constant_value input (default 0).
+                        let cval = if node.input.len() > 2 && !node.input[2].is_empty() {
+                            get(&node.input[2])?
+                                .to_dtype(DType::F64)?
+                                .flatten_all()?
+                                .to_vec1::<f64>()?
+                                .first()
+                                .copied()
+                                .unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
+
+                        let mut out = data.clone();
+                        for (i, _dim) in data.dims().iter().enumerate() {
+                            let pre = pads_pre[i].max(0) as usize;
+                            let post = pads_post[i].max(0) as usize;
+                            if pre == 0 && post == 0 {
+                                continue;
+                            }
+                            if cval == 0.0 {
+                                out = out.pad_with_zeros(i, pre, post)?;
+                            } else {
+                                // Concat [pre-block, data, post-block] of the
+                                // constant value along axis `i`.
+                                let mk = |n: usize| -> Result<Tensor> {
+                                    let mut shape = out.dims().to_vec();
+                                    shape[i] = n;
+                                    Ok((Tensor::ones(shape, out.dtype(), out.device())? * cval)?)
+                                };
+                                let mut parts = Vec::new();
+                                if pre > 0 {
+                                    parts.push(mk(pre)?);
+                                }
+                                parts.push(out.clone());
+                                if post > 0 {
+                                    parts.push(mk(post)?);
+                                }
+                                out = Tensor::cat(&parts, i)?;
+                            }
+                        }
+
+                        values.insert(node.output[0].clone(), out);
+                    }
                     "reflect" => {
                         let mut out = data.clone();
                         for (i, &dim) in data.dims().iter().enumerate().rev() {
@@ -1222,6 +1266,37 @@ fn simple_eval_(
                         node.name
                     ),
                 }
+            }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#depthtospace
+            "DepthToSpace" => {
+                let data = get(&node.input[0])?;
+                let (n, c, h, w) = data.dims4()?;
+                let b = get_attr::<i64>(node, "blocksize")?;
+                let b = *b as usize;
+                if b == 0 || c % (b * b) != 0 {
+                    bail!(
+                        "DepthToSpace: channels {c} not divisible by blocksize^2 ({})",
+                        b * b
+                    );
+                }
+                let c_out = c / (b * b);
+                let mode = get_attr_opt::<str>(node, "mode")?.unwrap_or("DCR");
+                let out = match mode {
+                    // DCR (default): depth index iterates b, b, c_out.
+                    "DCR" => data
+                        .reshape((n, b, b, c_out, h, w))?
+                        .permute((0, 3, 4, 1, 5, 2))?
+                        .contiguous()?
+                        .reshape((n, c_out, h * b, w * b))?,
+                    // CRD: depth index iterates c_out, b, b.
+                    "CRD" => data
+                        .reshape((n, c_out, b, b, h, w))?
+                        .permute((0, 1, 4, 2, 5, 3))?
+                        .contiguous()?
+                        .reshape((n, c_out, h * b, w * b))?,
+                    _ => bail!("DepthToSpace: unsupported mode {mode:?}"),
+                };
+                values.insert(node.output[0].clone(), out);
             }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#slice
             "Slice" => {
@@ -2287,17 +2362,22 @@ fn simple_eval_(
                     bail!("Unsupported rank for nearest resize: {}", input.rank());
                 }
 
-                let scales = if node.input.len() > 2 && !node.input[2].is_empty() {
-                    Some(get(&node.input[2])?)
-                } else {
-                    None
+                // tf2onnx wires both `scales` and `sizes`, passing an empty
+                // (0-element) tensor for the unused one — treat that as unset.
+                let nonempty = |idx: usize| -> Result<Option<Tensor>> {
+                    if node.input.len() > idx && !node.input[idx].is_empty() {
+                        let t = get(&node.input[idx])?;
+                        if t.elem_count() == 0 {
+                            Ok(None)
+                        } else {
+                            Ok(Some(t.clone()))
+                        }
+                    } else {
+                        Ok(None)
+                    }
                 };
-
-                let sizes = if node.input.len() > 3 && !node.input[3].is_empty() {
-                    Some(get(&node.input[3])?)
-                } else {
-                    None
-                };
+                let scales = nonempty(2)?;
+                let sizes = nonempty(3)?;
 
                 let output_dims = match (scales, sizes) {
                     (Some(_), Some(_)) => {
@@ -2329,24 +2409,29 @@ fn simple_eval_(
                 let nearest_mode =
                     get_attr_opt::<str>(node, "nearest_mode")?.unwrap_or("round_prefer_floor");
 
-                if mode != "nearest" {
-                    bail!("Unsupported resize mode: {}", mode);
-                }
-
-                if nearest_mode != "floor" {
-                    bail!("Unsupported nearest_mode for resize: {}", nearest_mode);
-                }
-
-                if coordinate_transformation_mode != "asymmetric" {
-                    bail!(
-                        "Unsupported coordinate_transformation_mode for resize: {}",
-                        coordinate_transformation_mode
-                    );
-                }
-
                 let h = output_dims[2];
                 let w = output_dims[3];
-                let output = input.upsample_nearest2d(h, w)?;
+                let output = match mode {
+                    "nearest" => {
+                        if nearest_mode != "floor" {
+                            bail!("Unsupported nearest_mode for resize: {}", nearest_mode);
+                        }
+                        if coordinate_transformation_mode != "asymmetric" {
+                            bail!(
+                                "Unsupported coordinate_transformation_mode for resize: {}",
+                                coordinate_transformation_mode
+                            );
+                        }
+                        input.upsample_nearest2d(h, w)?
+                    }
+                    // Bilinear. ONNX `align_corners` maps to candle's flag;
+                    // other coordinate modes approximate with align_corners=false.
+                    "linear" | "bilinear" => {
+                        let align_corners = coordinate_transformation_mode == "align_corners";
+                        input.upsample_bilinear2d(h, w, align_corners)?
+                    }
+                    _ => bail!("Unsupported resize mode: {}", mode),
+                };
 
                 values.insert(node.output[0].clone(), output);
             }
