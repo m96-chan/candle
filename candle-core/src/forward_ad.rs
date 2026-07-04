@@ -374,7 +374,10 @@ fn node_tangent(node: &Tensor, tangents: &HashMap<TensorId, MaybeTangent>) -> Re
                 }
             }
         },
-        Op::Copy(a) => t(a),
+        // `contiguous()` records a Copy; the tangent must be layout-
+        // normalized the same way (e.g. before a matmul that requires a
+        // contiguous lhs).
+        Op::Copy(a) => t(a).map(|ta| ta.contiguous()).transpose()?,
         Op::Broadcast(a) => t(a).map(|ta| ta.broadcast_as(node.shape())).transpose()?,
         Op::Narrow(a, dim, start, len) => {
             t(a).map(|ta| ta.narrow(*dim, *start, *len)).transpose()?
