@@ -52,6 +52,7 @@ mod accelerate;
 pub mod backend;
 pub mod backprop;
 pub mod conv;
+pub mod forward_ad;
 mod convert;
 pub mod cpu;
 pub mod cpu_backend;
