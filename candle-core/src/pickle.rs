@@ -726,15 +726,37 @@ pub fn read_pth_tensor_info<P: AsRef<std::path::Path>>(
 
         // If the object is a dict, then we can extract the tensor info from it.
         // NOTE: We are assuming that the `obj` is state_dict by this stage.
-        if let Object::Dict(key_values) = obj {
-            for (name, value) in key_values.into_iter() {
-                match value.into_tensor_info(name, &dir_name) {
-                    Ok(Some(tensor_info)) => tensor_infos.push(tensor_info),
-                    Ok(None) => {}
-                    Err(err) => eprintln!("skipping: {err:?}"),
+        // Checkpoints frequently nest state dicts (e.g. `{net: {cfm: …}}`);
+        // descend recursively, joining the keys with '.' like PyTorch's
+        // own state_dict naming.
+        fn extract(
+            prefix: Option<&str>,
+            obj: Object,
+            dir_name: &std::path::Path,
+            tensor_infos: &mut Vec<TensorInfo>,
+        ) {
+            if let Object::Dict(key_values) = obj {
+                for (name, value) in key_values.into_iter() {
+                    let name = match name.unicode() {
+                        Ok(name) => name,
+                        Err(_) => continue,
+                    };
+                    let full = match prefix {
+                        Some(p) => format!("{p}.{name}"),
+                        None => name,
+                    };
+                    match value {
+                        Object::Dict(_) => extract(Some(&full), value, dir_name, tensor_infos),
+                        value => match value.into_tensor_info(Object::Unicode(full), dir_name) {
+                            Ok(Some(tensor_info)) => tensor_infos.push(tensor_info),
+                            Ok(None) => {}
+                            Err(err) => eprintln!("skipping: {err:?}"),
+                        },
+                    }
                 }
             }
         }
+        extract(None, obj, &dir_name, &mut tensor_infos);
     }
     Ok(tensor_infos)
 }
