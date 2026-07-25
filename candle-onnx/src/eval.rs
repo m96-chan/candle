@@ -251,8 +251,15 @@ fn simple_eval_(
     graph: &onnx::GraphProto,
     values: &mut HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>> {
+    // Place initializers on the same device as the provided inputs (e.g. Metal),
+    // so weight/input ops don't hit a CPU-vs-GPU device mismatch.
+    let target_device = values
+        .values()
+        .next()
+        .map(|t| t.device().clone())
+        .unwrap_or(Device::Cpu);
     for t in graph.initializer.iter() {
-        let tensor = get_tensor(t, t.name.as_str())?;
+        let tensor = get_tensor(t, t.name.as_str())?.to_device(&target_device)?;
         values.insert(t.name.to_string(), tensor);
     }
     for input in graph.input.iter() {
@@ -969,6 +976,84 @@ fn simple_eval_(
                 } else {
                     ys
                 };
+                values.insert(node.output[0].clone(), ys);
+            }
+            // Added for VPresentation/THA4 (m96-chan/candle avatacam).
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#ConvTranspose
+            "ConvTranspose" => {
+                let groups = get_attr_opt::<i64>(node, "group")?.copied().unwrap_or(1);
+                if groups != 1 {
+                    bail!("ConvTranspose with group != 1 is not supported ({})", node.name)
+                }
+                let strides = get_attr_opt::<[i64]>(node, "strides")?;
+                let pads = get_attr_opt::<[i64]>(node, "pads")?;
+                let dilations = get_attr_opt::<[i64]>(node, "dilations")?;
+                let output_padding = get_attr_opt::<[i64]>(node, "output_padding")?;
+                let one2 = |v: Option<&[i64]>, name: &str| -> Result<usize> {
+                    match v {
+                        None => Ok(0),
+                        Some([p]) => Ok(*p as usize),
+                        Some([p1, p2]) => {
+                            if p1 != p2 {
+                                bail!("ConvTranspose {name} must be symmetric, got {p1},{p2}")
+                            }
+                            Ok(*p1 as usize)
+                        }
+                        Some([p1, p2, p3, p4]) => {
+                            if p1 != p2 || p1 != p3 || p1 != p4 {
+                                bail!("ConvTranspose {name} must be symmetric, got {p1},{p2},{p3},{p4}")
+                            }
+                            Ok(*p1 as usize)
+                        }
+                        Some(o) => bail!("unexpected ConvTranspose {name} {o:?}"),
+                    }
+                };
+                let stride = match strides {
+                    None => 1,
+                    v => one2(v, "strides")?.max(1),
+                };
+                let padding = one2(pads, "pads")?;
+                let out_pad = one2(output_padding, "output_padding")?;
+                let dilation = match dilations {
+                    None => 1,
+                    v => one2(v, "dilations")?.max(1),
+                };
+                let xs = get(&node.input[0])?;
+                let ws = get(&node.input[1])?;
+                let ys = xs.conv_transpose2d(ws, padding, out_pad, stride, dilation)?;
+                let ys = if node.input.len() > 2 {
+                    let bs = get(&node.input[2])?;
+                    let mut bs_shape = vec![1; ys.rank()];
+                    bs_shape[1] = bs.elem_count();
+                    ys.broadcast_add(&bs.reshape(bs_shape)?)?
+                } else {
+                    ys
+                };
+                values.insert(node.output[0].clone(), ys);
+            }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#InstanceNormalization
+            "InstanceNormalization" => {
+                let eps = get_attr_opt::<f32>(node, "epsilon")?.copied().unwrap_or(1e-5);
+                let xs = get(&node.input[0])?;
+                let scale = get(&node.input[1])?;
+                let bias = get(&node.input[2])?;
+                if xs.rank() != 4 {
+                    bail!("InstanceNormalization expects a 4D tensor, got {:?}", xs.dims())
+                }
+                // Per-(batch, channel) statistics over the spatial dims.
+                let mean = xs.mean_keepdim(3)?.mean_keepdim(2)?;
+                let centered = xs.broadcast_sub(&mean)?;
+                let var = centered.sqr()?.mean_keepdim(3)?.mean_keepdim(2)?;
+                let normed = centered.broadcast_div(&(var + eps as f64)?.sqrt()?)?;
+                let target_shape: Vec<usize> = xs
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, v)| if idx == 1 { *v } else { 1 })
+                    .collect();
+                let scale = scale.reshape(target_shape.as_slice())?;
+                let bias = bias.reshape(target_shape.as_slice())?;
+                let ys = normed.broadcast_mul(&scale)?.broadcast_add(&bias)?;
                 values.insert(node.output[0].clone(), ys);
             }
             "Concat" => {
