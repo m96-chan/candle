@@ -1043,11 +1043,21 @@ fn simple_eval_(
                 }
                 let (n, c) = (dims[0], dims[1]);
                 let spatial: usize = dims[2..].iter().product::<usize>().max(1);
-                // Per-(batch, channel) statistics over all spatial dims (any rank).
-                let x3 = xs.reshape((n, c, spatial))?;
-                let mean = x3.mean_keepdim(2)?;
-                let centered = x3.broadcast_sub(&mean)?;
-                let var = centered.sqr()?.mean_keepdim(2)?;
+                // Two-level reduction: split the spatial axis into ~sqrt-sized groups
+                // so each partial sum is small. A single flat f32 sum over a large
+                // axis loses precision, which corrupts the tiny variance of a
+                // near-constant feature and makes CPU and Metal diverge badly.
+                // Mean/var over equal-sized groups equals the exact overall mean/var.
+                let mut s1 = (spatial as f64).sqrt() as usize;
+                while s1 > 1 && spatial % s1 != 0 {
+                    s1 -= 1;
+                }
+                let s1 = s1.max(1);
+                let s2 = spatial / s1;
+                let x4 = xs.reshape((n, c, s1, s2))?;
+                let mean = x4.mean_keepdim(3)?.mean_keepdim(2)?;
+                let centered = x4.broadcast_sub(&mean)?;
+                let var = centered.sqr()?.mean_keepdim(3)?.mean_keepdim(2)?;
                 let normed = centered
                     .broadcast_div(&(var + eps as f64)?.sqrt()?)?
                     .reshape(dims.clone())?;

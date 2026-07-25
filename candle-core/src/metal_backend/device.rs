@@ -469,7 +469,19 @@ mod tests {
     }
 }
 
+/// When set, `find_available_buffer` never recycles a pooled buffer. Reusing a
+/// `strong_count==1` buffer is unsafe if an encoded-but-not-yet-run kernel still
+/// references it, which silently corrupts outputs on large graphs (e.g. the THA4
+/// upscaler). Trades memory for correctness. Read once (hot allocation path).
+fn buffer_reuse_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var("CANDLE_METAL_NO_BUFFER_REUSE").is_ok())
+}
+
 fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
+    if buffer_reuse_disabled() {
+        return None;
+    }
     let mut best_buffer: Option<&Arc<Buffer>> = None;
     let mut best_buffer_size = usize::MAX;
     for (buffer_size, subbuffers) in buffers.iter() {
