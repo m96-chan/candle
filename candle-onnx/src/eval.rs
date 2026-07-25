@@ -1056,6 +1056,68 @@ fn simple_eval_(
                 let ys = normed.broadcast_mul(&scale)?.broadcast_add(&bias)?;
                 values.insert(node.output[0].clone(), ys);
             }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#GridSample
+            // Implements the single configuration THA4 uses: bilinear + border.
+            "GridSample" => {
+                let mode = get_attr_opt::<str>(node, "mode")?.unwrap_or("bilinear");
+                let padding_mode = get_attr_opt::<str>(node, "padding_mode")?.unwrap_or("zeros");
+                let align_corners =
+                    get_attr_opt::<i64>(node, "align_corners")?.copied().unwrap_or(0) != 0;
+                if mode != "bilinear" && mode != "linear" {
+                    bail!("GridSample: only bilinear is supported, got {mode} ({})", node.name)
+                }
+                if padding_mode != "border" {
+                    bail!("GridSample: only border padding is supported, got {padding_mode} ({})", node.name)
+                }
+                let image = get(&node.input[0])?;
+                let grid = get(&node.input[1])?;
+                let (n, c, h, w) = image.dims4()?;
+                let (_gn, ho, wo, _two) = grid.dims4()?;
+                let gx = grid.narrow(3, 0, 1)?.squeeze(3)?;
+                let gy = grid.narrow(3, 1, 1)?.squeeze(3)?;
+                let (ix_raw, iy_raw) = if align_corners {
+                    (gx.affine(0.5 * (w as f64 - 1.0), 0.5 * (w as f64 - 1.0))?,
+                     gy.affine(0.5 * (h as f64 - 1.0), 0.5 * (h as f64 - 1.0))?)
+                } else {
+                    (gx.affine(0.5 * w as f64, 0.5 * (w as f64 - 1.0))?,
+                     gy.affine(0.5 * h as f64, 0.5 * (h as f64 - 1.0))?)
+                };
+                // border padding: clamp the coordinate, then bilinear interpolate.
+                let ix = ix_raw.clamp(0f32, (w - 1) as f32)?;
+                let iy = iy_raw.clamp(0f32, (h - 1) as f32)?;
+                let x0 = ix.floor()?;
+                let y0 = iy.floor()?;
+                let wx1 = ix.sub(&x0)?;
+                let wy1 = iy.sub(&y0)?;
+                let wx0 = wx1.affine(-1.0, 1.0)?;
+                let wy0 = wy1.affine(-1.0, 1.0)?;
+                let x1 = x0.affine(1.0, 1.0)?;
+                let y1 = y0.affine(1.0, 1.0)?;
+                let x0c = x0.clamp(0f32, (w - 1) as f32)?;
+                let x1c = x1.clamp(0f32, (w - 1) as f32)?;
+                let y0c = y0.clamp(0f32, (h - 1) as f32)?;
+                let y1c = y1.clamp(0f32, (h - 1) as f32)?;
+                let lin = |yy: &Tensor, xx: &Tensor| -> Result<Tensor> {
+                    yy.affine(w as f64, 0.0)?.add(xx)?.to_dtype(DType::U32)
+                };
+                let img_flat = image.contiguous()?.reshape((n, c, h * w))?;
+                let gather_corner = |idx: &Tensor| -> Result<Tensor> {
+                    let idx = idx.reshape((n, 1, ho * wo))?.broadcast_as((n, c, ho * wo))?.contiguous()?;
+                    img_flat.gather(&idx, 2)
+                };
+                let v00 = gather_corner(&lin(&y0c, &x0c)?)?;
+                let v01 = gather_corner(&lin(&y0c, &x1c)?)?;
+                let v10 = gather_corner(&lin(&y1c, &x0c)?)?;
+                let v11 = gather_corner(&lin(&y1c, &x1c)?)?;
+                let wt = |a: &Tensor, b: &Tensor| -> Result<Tensor> { a.mul(b)?.reshape((n, 1, ho * wo)) };
+                let out = v00
+                    .broadcast_mul(&wt(&wy0, &wx0)?)?
+                    .add(&v01.broadcast_mul(&wt(&wy0, &wx1)?)?)?
+                    .add(&v10.broadcast_mul(&wt(&wy1, &wx0)?)?)?
+                    .add(&v11.broadcast_mul(&wt(&wy1, &wx1)?)?)?
+                    .reshape((n, c, ho, wo))?;
+                values.insert(node.output[0].clone(), out);
+            }
             "Concat" => {
                 // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Concat
                 let inputs = node
