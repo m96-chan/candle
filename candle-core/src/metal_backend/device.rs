@@ -475,7 +475,10 @@ mod tests {
 /// upscaler). Trades memory for correctness. Read once (hot allocation path).
 fn buffer_reuse_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var("CANDLE_METAL_NO_BUFFER_REUSE").is_ok())
+    *DISABLED.get_or_init(|| match std::env::var("CANDLE_METAL_NO_BUFFER_REUSE") {
+        Ok(v) => v != "0" && !v.is_empty(),
+        Err(_) => false,
+    })
 }
 
 fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
