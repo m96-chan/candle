@@ -258,9 +258,28 @@ fn simple_eval_(
         .next()
         .map(|t| t.device().clone())
         .unwrap_or(Device::Cpu);
+    // Optional half-precision compute: float weights/inputs run as f16 to halve
+    // memory traffic (the bottleneck for these graphs on Metal). Integer/shape
+    // tensors are left alone; precision-sensitive ops (InstanceNorm) upcast
+    // internally.
+    let f16_mode = std::env::var_os("CANDLE_ONNX_F16").is_some();
+    let cast_f16 = |t: Tensor| -> Result<Tensor> {
+        if f16_mode && t.dtype() == DType::F32 {
+            t.to_dtype(DType::F16)
+        } else {
+            Ok(t)
+        }
+    };
     for t in graph.initializer.iter() {
-        let tensor = get_tensor(t, t.name.as_str())?.to_device(&target_device)?;
+        let tensor = cast_f16(get_tensor(t, t.name.as_str())?.to_device(&target_device)?)?;
         values.insert(t.name.to_string(), tensor);
+    }
+    if f16_mode {
+        let keys: Vec<String> = values.keys().cloned().collect();
+        for k in keys {
+            let t = values.remove(&k).unwrap();
+            values.insert(k, cast_f16(t)?);
+        }
     }
     for input in graph.input.iter() {
         let input_type = match &input.r#type {
@@ -318,7 +337,10 @@ fn simple_eval_(
                 }
             }
         };
-        if dt != tensor.dtype() {
+        // In f16 mode float inputs were downcast on purpose; don't reject them.
+        let dtype_ok = dt == tensor.dtype()
+            || (f16_mode && dt == DType::F32 && tensor.dtype() == DType::F16);
+        if !dtype_ok {
             bail!(
                 "unexpected dtype for {}, got {:?}, expected {dt:?}",
                 input.name,
@@ -1061,9 +1083,11 @@ fn simple_eval_(
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#InstanceNormalization
             "InstanceNormalization" => {
                 let eps = get_attr_opt::<f32>(node, "epsilon")?.copied().unwrap_or(1e-5);
-                let xs = get(&node.input[0])?;
-                let scale = get(&node.input[1])?;
-                let bias = get(&node.input[2])?;
+                let out_dtype = get(&node.input[0])?.dtype();
+                // Compute statistics in f32 for stability (f16 variance is unusable).
+                let xs = get(&node.input[0])?.to_dtype(DType::F32)?;
+                let scale = get(&node.input[1])?.to_dtype(DType::F32)?;
+                let bias = get(&node.input[2])?.to_dtype(DType::F32)?;
                 let dims = xs.dims().to_vec();
                 if dims.len() < 2 {
                     bail!("InstanceNormalization expects rank >= 2, got {dims:?}")
@@ -1092,7 +1116,7 @@ fn simple_eval_(
                 target_shape[1] = c;
                 let scale = scale.reshape(target_shape.as_slice())?;
                 let bias = bias.reshape(target_shape.as_slice())?;
-                let ys = normed.broadcast_mul(&scale)?.broadcast_add(&bias)?;
+                let ys = normed.broadcast_mul(&scale)?.broadcast_add(&bias)?.to_dtype(out_dtype)?;
                 values.insert(node.output[0].clone(), ys);
             }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#GridSample
@@ -1184,6 +1208,8 @@ fn simple_eval_(
                     .contiguous()?; // (N, H*W, 3)
                 let theta_t = theta.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?; // (N, 3, 2)
                 let grid = base.matmul(&theta_t)?.reshape((n, h, w, 2))?;
+                // Match the model dtype (e.g. f16) so downstream Add/GridSample agree.
+                let grid = grid.to_dtype(theta.dtype())?;
                 values.insert(node.output[0].clone(), grid);
             }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Einsum
@@ -2876,6 +2902,18 @@ fn simple_eval_(
             }
             op_type => bail!("unsupported op_type {op_type} for op {node:?}"),
         }
+        // Keep every float intermediate in f16 (constants/ranges/etc. are created
+        // as f32 during eval); leaves int/shape tensors untouched.
+        if f16_mode {
+            for out in node.output.iter() {
+                if let Some(t) = values.get(out) {
+                    if t.dtype() == DType::F32 {
+                        let t16 = t.to_dtype(DType::F16)?;
+                        values.insert(out.clone(), t16);
+                    }
+                }
+            }
+        }
         if let Some(t0) = _op_t0 {
             target_device.synchronize()?;
             let e = op_times.entry(node.op_type.clone()).or_insert((0, 0));
@@ -2895,7 +2933,15 @@ fn simple_eval_(
         .iter()
         .map(|output| match values.remove(&output.name) {
             None => bail!("cannot find output {}", output.name),
-            Some(value) => Ok((output.name.clone(), value)),
+            // f16 is an internal compute detail; hand outputs back as f32.
+            Some(value) => {
+                let value = if f16_mode && value.dtype() == DType::F16 {
+                    value.to_dtype(DType::F32)?
+                } else {
+                    value
+                };
+                Ok((output.name.clone(), value))
+            }
         })
         .collect()
 }
