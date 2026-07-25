@@ -244,16 +244,52 @@ pub fn simple_eval(
         None => bail!("no graph defined in proto"),
         Some(graph) => graph,
     };
-    simple_eval_(graph, &mut inputs)
+    simple_eval_(graph, &mut inputs, false)
+}
+
+/// Pre-extract the graph's initializers (weights) as tensors, once.
+///
+/// `simple_eval` re-parses every initializer from the proto on **each**
+/// call, which dominates the cost of running a small model in a realtime
+/// loop (AvataCam / VRChatCameraOSC face stacks). Extract them once with
+/// this, then evaluate frames with [`simple_eval_with_initializers`].
+pub fn initializer_tensors(model: &onnx::ModelProto) -> Result<HashMap<String, Value>> {
+    let graph = match &model.graph {
+        None => bail!("no graph defined in proto"),
+        Some(graph) => graph,
+    };
+    let mut values = HashMap::new();
+    for t in graph.initializer.iter() {
+        values.insert(t.name.to_string(), get_tensor(t, t.name.as_str())?);
+    }
+    Ok(values)
+}
+
+/// Like [`simple_eval`], but `values` must already contain the graph's
+/// initializers alongside the inputs — clone the map returned by
+/// [`initializer_tensors`] (tensor clones are cheap Arc bumps) and insert
+/// the frame's inputs. Initializers are not re-extracted from the proto.
+pub fn simple_eval_with_initializers(
+    model: &onnx::ModelProto,
+    mut values: HashMap<String, Value>,
+) -> Result<HashMap<String, Value>> {
+    let graph = match &model.graph {
+        None => bail!("no graph defined in proto"),
+        Some(graph) => graph,
+    };
+    simple_eval_(graph, &mut values, true)
 }
 
 fn simple_eval_(
     graph: &onnx::GraphProto,
     values: &mut HashMap<String, Value>,
+    skip_initializers: bool,
 ) -> Result<HashMap<String, Value>> {
-    for t in graph.initializer.iter() {
-        let tensor = get_tensor(t, t.name.as_str())?;
-        values.insert(t.name.to_string(), tensor);
+    if !skip_initializers {
+        for t in graph.initializer.iter() {
+            let tensor = get_tensor(t, t.name.as_str())?;
+            values.insert(t.name.to_string(), tensor);
+        }
     }
     for input in graph.input.iter() {
         let input_type = match &input.r#type {
@@ -1167,7 +1203,8 @@ fn simple_eval_(
                         node.output.len()
                     );
                 }
-                let branch_out = simple_eval_(sub_graph, values)?;
+                // Subgraphs carry their own initializers — always extract.
+                let branch_out = simple_eval_(sub_graph, values, false)?;
                 for (i, out) in node.output.iter().enumerate() {
                     values.insert(
                         out.clone(),

@@ -7335,3 +7335,50 @@ fn test_one_hot() -> Result<()> {
 
     Ok(())
 }
+
+// Cached-initializer evaluation (AvataCam/VRChatCameraOSC realtime loops):
+// initializer_tensors + simple_eval_with_initializers must produce exactly
+// what simple_eval produces, without re-extracting weights per call.
+#[test]
+fn test_simple_eval_with_initializers_matches_simple_eval() -> Result<()> {
+    // y = x + w, with w carried as a graph initializer (a "weight").
+    let graph = create_model_proto_with_graph(Some(GraphProto {
+        node: vec![NodeProto {
+            op_type: "Add".to_string(),
+            input: vec!["x".into(), "w".into()],
+            output: vec!["y".into()],
+            ..Default::default()
+        }],
+        initializer: vec![TensorProto {
+            name: "w".into(),
+            data_type: DataType::Float as i32,
+            dims: vec![3],
+            float_data: vec![10.0, 20.0, 30.0],
+            ..Default::default()
+        }],
+        output: vec![ValueInfoProto {
+            name: "y".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+
+    let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (3,), &Device::Cpu)?;
+
+    let mut inputs = HashMap::new();
+    inputs.insert("x".to_string(), x.clone());
+    let baseline = simple_eval(&graph, inputs)?;
+    let baseline_y = baseline.get("y").unwrap().to_vec1::<f32>()?;
+    assert_eq!(baseline_y, vec![11.0, 22.0, 33.0]);
+
+    // Extract weights once, then evaluate twice reusing the cached map.
+    let consts = candle_onnx::eval::initializer_tensors(&graph)?;
+    assert!(consts.contains_key("w"), "initializer must be extracted");
+    for _ in 0..2 {
+        let mut values = consts.clone();
+        values.insert("x".to_string(), x.clone());
+        let out = candle_onnx::eval::simple_eval_with_initializers(&graph, values)?;
+        assert_eq!(out.get("y").unwrap().to_vec1::<f32>()?, baseline_y);
+    }
+    Ok(())
+}
