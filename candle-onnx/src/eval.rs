@@ -327,7 +327,10 @@ fn simple_eval_(
         }
     }
     // The nodes are topologically sorted so we can just process them in order.
+    let optime = std::env::var_os("CANDLE_ONNX_OPTIME").is_some();
+    let mut op_times: HashMap<String, (u128, u32)> = HashMap::new();
     for node in graph.node.iter() {
+        let _op_t0 = optime.then(std::time::Instant::now);
         let get = |input_name: &str| match values.get(input_name) {
             Some(value) => Ok(value),
             None => bail!("cannot find {input_name} for op '{}'", node.name),
@@ -878,7 +881,30 @@ fn simple_eval_(
                 };
                 let xs = get(&node.input[0])?;
                 let ws = get(&node.input[1])?;
-                let ys = match ws.rank() {
+                // Fast path: a 1x1 conv (stride 1, no pad/dilation, groups 1) is a
+                // per-pixel matmul, much faster than the conv kernel on Metal.
+                // THA4's SIREN body morpher is built entirely from 1x1 convs.
+                let all_ones = |o: Option<&[i64]>| o.map_or(true, |v| v.iter().all(|&x| x == 1));
+                let all_zero = |o: Option<&[i64]>| o.map_or(true, |v| v.iter().all(|&x| x == 0));
+                let is_1x1 = groups == 1
+                    && ws.rank() == 4
+                    && ws.dims()[2] == 1
+                    && ws.dims()[3] == 1
+                    && all_ones(strides)
+                    && all_ones(dilations)
+                    && all_zero(pads);
+                let ys = if is_1x1 {
+                    let (n, cin, h, w) = xs.dims4()?;
+                    let cout = ws.dims()[0];
+                    let x2 = xs.contiguous()?.reshape((n, cin, h * w))?;
+                    let wt = ws
+                        .reshape((cout, cin))?
+                        .reshape((1, cout, cin))?
+                        .broadcast_as((n, cout, cin))?
+                        .contiguous()?;
+                    wt.matmul(&x2)?.reshape((n, cout, h, w))?
+                } else {
+                    match ws.rank() {
                     3 => {
                         let (pads, xs) = match pads {
                             None => (0, xs.clone()),
@@ -967,6 +993,7 @@ fn simple_eval_(
                         "unsupported rank for weight matrix {rank} in conv {}",
                         node.name
                     ),
+                    }
                 };
                 let ys = if node.input.len() > 2 {
                     let bs = get(&node.input[2])?;
@@ -2848,6 +2875,19 @@ fn simple_eval_(
                 values.insert(node.output[0].clone(), output);
             }
             op_type => bail!("unsupported op_type {op_type} for op {node:?}"),
+        }
+        if let Some(t0) = _op_t0 {
+            target_device.synchronize()?;
+            let e = op_times.entry(node.op_type.clone()).or_insert((0, 0));
+            e.0 += t0.elapsed().as_micros();
+            e.1 += 1;
+        }
+    }
+    if optime {
+        let mut v: Vec<_> = op_times.into_iter().collect();
+        v.sort_by_key(|(_, (t, _))| std::cmp::Reverse(*t));
+        for (op, (t, n)) in v.iter().take(12) {
+            eprintln!("[optime] {op:<22} {:>8.2} ms  ({n} calls)", *t as f64 / 1000.0);
         }
     }
     graph
