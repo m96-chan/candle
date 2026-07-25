@@ -597,7 +597,7 @@ fn simple_eval_(
                     .collect();
 
                 let xs = Tensor::ones(shape_vec, value.dtype(), input.device())?
-                    .broadcast_mul(&value)?;
+                    .broadcast_mul(&value.to_device(input.device())?)?;
                 values.insert(node.output[0].clone(), xs);
             }
             "Unsqueeze" => {
@@ -773,7 +773,7 @@ fn simple_eval_(
                             to_vec0_flexible::<$t>(start)?,
                             to_vec0_flexible::<$t>(limit)?,
                             to_vec0_flexible::<$t>(delta)?,
-                            &Device::Cpu,
+                            &target_device,
                         )?
                     };
                 }
@@ -1037,20 +1037,22 @@ fn simple_eval_(
                 let xs = get(&node.input[0])?;
                 let scale = get(&node.input[1])?;
                 let bias = get(&node.input[2])?;
-                if xs.rank() != 4 {
-                    bail!("InstanceNormalization expects a 4D tensor, got {:?}", xs.dims())
+                let dims = xs.dims().to_vec();
+                if dims.len() < 2 {
+                    bail!("InstanceNormalization expects rank >= 2, got {dims:?}")
                 }
-                // Per-(batch, channel) statistics over the spatial dims.
-                let mean = xs.mean_keepdim(3)?.mean_keepdim(2)?;
-                let centered = xs.broadcast_sub(&mean)?;
-                let var = centered.sqr()?.mean_keepdim(3)?.mean_keepdim(2)?;
-                let normed = centered.broadcast_div(&(var + eps as f64)?.sqrt()?)?;
-                let target_shape: Vec<usize> = xs
-                    .dims()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, v)| if idx == 1 { *v } else { 1 })
-                    .collect();
+                let (n, c) = (dims[0], dims[1]);
+                let spatial: usize = dims[2..].iter().product::<usize>().max(1);
+                // Per-(batch, channel) statistics over all spatial dims (any rank).
+                let x3 = xs.reshape((n, c, spatial))?;
+                let mean = x3.mean_keepdim(2)?;
+                let centered = x3.broadcast_sub(&mean)?;
+                let var = centered.sqr()?.mean_keepdim(2)?;
+                let normed = centered
+                    .broadcast_div(&(var + eps as f64)?.sqrt()?)?
+                    .reshape(dims.clone())?;
+                let mut target_shape = vec![1usize; dims.len()];
+                target_shape[1] = c;
                 let scale = scale.reshape(target_shape.as_slice())?;
                 let bias = bias.reshape(target_shape.as_slice())?;
                 let ys = normed.broadcast_mul(&scale)?.broadcast_add(&bias)?;
@@ -1116,6 +1118,50 @@ fn simple_eval_(
                     .add(&v10.broadcast_mul(&wt(&wy1, &wx0)?)?)?
                     .add(&v11.broadcast_mul(&wt(&wy1, &wx1)?)?)?
                     .reshape((n, c, ho, wo))?;
+                values.insert(node.output[0].clone(), out);
+            }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#AffineGrid (2D)
+            "AffineGrid" => {
+                let align_corners =
+                    get_attr_opt::<i64>(node, "align_corners")?.copied().unwrap_or(0) != 0;
+                let theta = get(&node.input[0])?; // (N, 2, 3)
+                let size = get(&node.input[1])?.to_dtype(DType::I64)?.to_vec1::<i64>()?;
+                if size.len() != 4 {
+                    bail!("AffineGrid: only 2D (NCHW size) supported, got {size:?}")
+                }
+                let (n, h, w) = (size[0] as usize, size[2] as usize, size[3] as usize);
+                let device = theta.device();
+                let (xs, ys) = if align_corners {
+                    (Tensor::arange(0f32, w as f32, device)?.affine(2.0 / (w as f64 - 1.0), -1.0)?,
+                     Tensor::arange(0f32, h as f32, device)?.affine(2.0 / (h as f64 - 1.0), -1.0)?)
+                } else {
+                    (Tensor::arange(0f32, w as f32, device)?.affine(2.0 / w as f64, 1.0 / w as f64 - 1.0)?,
+                     Tensor::arange(0f32, h as f32, device)?.affine(2.0 / h as f64, 1.0 / h as f64 - 1.0)?)
+                };
+                let x_grid = xs.reshape((1, w, 1))?.broadcast_as((h, w, 1))?;
+                let y_grid = ys.reshape((h, 1, 1))?.broadcast_as((h, w, 1))?;
+                let ones = Tensor::ones((h, w, 1), DType::F32, device)?;
+                let base = Tensor::cat(&[&x_grid, &y_grid, &ones], 2)?
+                    .reshape((1, h * w, 3))?
+                    .broadcast_as((n, h * w, 3))?
+                    .contiguous()?; // (N, H*W, 3)
+                let theta_t = theta.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?; // (N, 3, 2)
+                let grid = base.matmul(&theta_t)?.reshape((n, h, w, 2))?;
+                values.insert(node.output[0].clone(), grid);
+            }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Einsum
+            // Only the two attention contractions THA4 uses are supported.
+            "Einsum" => {
+                let eq: &str = get_attr(node, "equation")?;
+                let a = get(&node.input[0])?.contiguous()?;
+                let b = get(&node.input[1])?.contiguous()?;
+                let out = match eq {
+                    // (b,c,t)^T · (b,c,s) -> (b,t,s)
+                    "bct,bcs->bts" => a.transpose(1, 2)?.contiguous()?.matmul(&b)?,
+                    // (b,c,s) · (b,t,s)^T -> (b,c,t)
+                    "bts,bcs->bct" => b.matmul(&a.transpose(1, 2)?.contiguous()?)?,
+                    _ => bail!("Einsum: unsupported equation '{eq}' ({})", node.name),
+                };
                 values.insert(node.output[0].clone(), out);
             }
             "Concat" => {
@@ -1238,7 +1284,7 @@ fn simple_eval_(
                 let output = match value.r#type() {
                     AttributeType::Tensor => {
                         let t = value.t.as_ref().unwrap();
-                        get_tensor(t, &node.name)?
+                        get_tensor(t, &node.name)?.to_device(&target_device)?
                     }
                     rtype => bail!("unsupported 'value' type {rtype:?} for {}", node.name),
                 };
@@ -2027,8 +2073,8 @@ fn simple_eval_(
                 let alpha = get_attr_opt::<f32>(node, "alpha")?.copied().unwrap_or(1.0);
                 let beta = get_attr_opt::<f32>(node, "beta")?.copied().unwrap_or(1.0);
 
-                let alpha = Tensor::full(alpha, a.shape(), &Device::Cpu)?;
-                let beta = Tensor::full(beta, c.shape(), &Device::Cpu)?;
+                let alpha = Tensor::full(alpha, a.shape(), a.device())?;
+                let beta = Tensor::full(beta, c.shape(), c.device())?;
 
                 let trans_a = get_attr_opt::<i64>(node, "transA")?.copied().unwrap_or(0);
                 let trans_b = get_attr_opt::<i64>(node, "transB")?.copied().unwrap_or(0);
