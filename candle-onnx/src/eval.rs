@@ -524,6 +524,21 @@ fn simple_eval_(
                 };
                 values.insert(node.output[0].clone(), ys);
             }
+            "GlobalAveragePool" => {
+                // https://github.com/onnx/onnx/blob/main/docs/Operators.md#GlobalAveragePool
+                // Mean over every spatial dim (all dims after N,C), keepdims.
+                // Needed by Project Babble's EfficientNet head (issue #20).
+                let xs = get(&node.input[0])?;
+                let rank = xs.rank();
+                if rank < 3 {
+                    bail!("GlobalAveragePool expects at least 3 dims, got {rank}")
+                }
+                let mut ys = xs.clone();
+                for dim in (2..rank).rev() {
+                    ys = ys.mean_keepdim(dim)?;
+                }
+                values.insert(node.output[0].clone(), ys);
+            }
             "AveragePool" => {
                 // https://github.com/onnx/onnx/blob/main/docs/Operators.md#AveragePool
                 let dilations = get_attr_opt::<[i64]>(node, "dilations")?;
